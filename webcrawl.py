@@ -2,6 +2,7 @@ import time
 import random
 import requests
 import json
+import os
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
@@ -33,6 +34,57 @@ chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64
 
 # Configure service
 service = Service('/usr/bin/chromedriver')  # Replace with the path to your ChromeDriver
+
+# Replace the URL constant with base URL
+BASE_URL = "https://holland2stay.com/residences"
+URL_PARAMS = "available_to_book%5Bfilter%5D=Available+to+book%2C179&city%5Bfilter%5D=Eindhoven%2C29"
+
+# Function to get the URL for a specific page
+def get_page_url(page_number):
+    return f"{BASE_URL}?page={page_number}&{URL_PARAMS}"
+
+# Function to determine the total number of pages
+def get_total_pages(driver):
+    try:
+        # Navigate to page 1 first
+        driver.get(get_page_url(1))
+        WebDriverWait(driver, 30).until(
+            lambda d: d.execute_script("return document.readyState") == "complete"
+        )
+        
+        # Wait a bit more for dynamic content to load
+        time.sleep(3)
+        
+        # Find pagination element - more flexible selector
+        soup = BeautifulSoup(driver.page_source, 'html.parser')
+        pagination = soup.find('ul', class_=lambda c: c and 'residence_pagination' in c)
+        
+        if not pagination:
+            print("No pagination found with class 'residence_pagination', trying other selectors...")
+            # Try finding pagination by role attribute
+            pagination = soup.find('ul', attrs={'role': 'navigation', 'aria-label': 'Pagination'})
+            
+        if not pagination:
+            print("No pagination found, assuming only one page\n")
+            return 1
+            
+        # Find all page links (excluding next/previous arrows)
+        page_items = pagination.find_all('li')
+        max_page = 1
+        
+        # print(f"Found {len(page_items)} pagination items")
+        
+        for item in page_items:
+            a_tag = item.find('a')
+            if a_tag and a_tag.text.strip() and a_tag.text.strip().isdigit():
+                page_num = int(a_tag.text.strip())
+                max_page = max(max_page, page_num)
+        
+        print(f"Found {max_page} total pages\n")
+        return max_page
+    except Exception as e:
+        print(f"Error determining total pages: {str(e)}")
+        return 1  # Default to 1 page if we can't determine
 
 # Function to send a Telegram message
 def send_telegram_message(message):
@@ -129,93 +181,108 @@ def write_properties_to_file(properties):
     except Exception as e:
         print(f"Error writing properties to file: {str(e)}")
 
-# Function to scrape properties
+# Function to scrape properties from all pages
 def scrape_properties(driver):
-    try:
-        driver.get(URL)
-        # Wait for content to load
-        WebDriverWait(driver, 30).until(
-            lambda d: d.execute_script("return document.readyState") == "complete"
-        )
-        
-        # Check for 502 error
-        if is_502_error(driver):
-            print("502 Bad Gateway Error. Retrying...")
-            return []
-        
-        # Wait for actual content to be visible and properly loaded
-        max_retries = 5
-        retry_count = 0
-        
-        while retry_count < max_retries:
-            if is_page_fully_loaded(driver):
-                break
-            print(f"Page not fully loaded yet. Waiting... (attempt {retry_count+1}/{max_retries})")
+    all_properties = []
+    
+    # First determine total number of pages
+    total_pages = get_total_pages(driver)
+    
+    for page_num in range(1, total_pages + 1):
+        try:
+            page_url = get_page_url(page_num)
+            print(f"Scanning page {page_num}/{total_pages}")
+            
+            driver.get(page_url)
+            # Wait for content to load
             time.sleep(3)
-            retry_count += 1
             
-        if retry_count >= max_retries:
-            print("Failed to fully load page content after multiple attempts")
-            return []
-        
-        page_source = driver.page_source
-        soup = BeautifulSoup(page_source, 'html.parser')
-        
-        properties = []
-        property_blocks = soup.find_all('div', class_='residence_block')
-        
-        if not property_blocks:
-            print("Warning: No property blocks found. Page might not have loaded correctly.")
-            return []
+            # Check for 502 error
+            if is_502_error(driver):
+                print(f"502 Bad Gateway Error on page {page_num}. Retrying...")
+                time.sleep(5)  # Wait before retry
+                driver.get(page_url)  # Try again
+                if is_502_error(driver):  # If still error, skip this page
+                    print(f"Still getting 502 error on page {page_num}. Skipping...")
+                    continue
             
-        for property_block in property_blocks:
-            try:
-                # Extract property name
-                name_tag = property_block.find('div', class_='leftSide')
-                if not name_tag:
-                    continue
-                    
-                name_element = name_tag.find('h5', class_='residence_name')
-                if not name_element:
-                    continue
-                    
-                property_name = name_element.text.strip()
-                if not property_name or len(property_name) <= 1:
-                    continue
+            # Wait for actual content to be visible and properly loaded
+            max_retries = 5
+            retry_count = 0
+            
+            while retry_count < max_retries:
+                if is_page_fully_loaded(driver):
+                    break
+                print(f"Page {page_num} not fully loaded yet. Waiting... (attempt {retry_count+1}/{max_retries})")
+                time.sleep(3)
+                retry_count += 1
                 
-                # Extract property price
-                price_tag = property_block.find('div', class_='rightSide')
-                if not price_tag:
-                    continue
-                    
-                price_element = price_tag.find('h4', class_='price_text')
-                if not price_element:
-                    continue
-                    
-                property_price = price_element.text.strip()
-                if not property_price or len(property_price) <= 1:
-                    continue
-                
-                # Only add if both name and price are valid
-                if property_name and property_price:
-                    # print(f"Found property: {property_name} - {property_price}")
-                    properties.append((property_name, property_price))
-            except Exception as e:
-                print(f"Error parsing property block: {str(e)}")
+            if retry_count >= max_retries:
+                print(f"Failed to fully load page {page_num} content after multiple attempts")
                 continue
-        
-        print(f"Successfully scraped {len(properties)} properties")
-        return properties
-    except TimeoutException:
-        print("Page load timed out. Restarting driver...")
-        return []
-    except Exception as e:
-        print(f"Error scraping properties: {str(e)}")
-        return []
+            
+            page_source = driver.page_source
+            soup = BeautifulSoup(page_source, 'html.parser')
+            
+            property_blocks = soup.find_all('div', class_='residence_block')
+            
+            if not property_blocks:
+                print(f"Warning: No property blocks found on page {page_num}. Page might not have loaded correctly.")
+                continue
+                
+            page_properties = []
+            for property_block in property_blocks:
+                try:
+                    # Extract property name
+                    name_tag = property_block.find('div', class_='leftSide')
+                    if not name_tag:
+                        continue
+                        
+                    name_element = name_tag.find('h5', class_='residence_name')
+                    if not name_element:
+                        continue
+                        
+                    property_name = name_element.text.strip()
+                    if not property_name or len(property_name) <= 1:
+                        continue
+                    
+                    # Extract property price
+                    price_tag = property_block.find('div', class_='rightSide')
+                    if not price_tag:
+                        continue
+                        
+                    price_element = price_tag.find('h4', class_='price_text')
+                    if not price_element:
+                        continue
+                        
+                    property_price = price_element.text.strip()
+                    if not property_price or len(property_price) <= 1:
+                        continue
+                    
+                    # Only add if both name and price are valid
+                    if property_name and property_price:
+                        page_properties.append((property_name, property_price))
+                except Exception as e:
+                    print(f"Error parsing property block: {str(e)}")
+                    continue
+            
+            print(f"Found {len(page_properties)} properties on page {page_num}")
+            all_properties.extend(page_properties)
+            
+        except TimeoutException:
+            print(f"Page {page_num} load timed out. Skipping...")
+            continue
+        except Exception as e:
+            print(f"Error scraping properties on page {page_num}: {str(e)}")
+            continue
+    if total_pages > 1:
+        print(f"Successfully scraped a total of {len(all_properties)} properties across {total_pages} pages")
+    return all_properties
 
 # Function to monitor the website
 def monitor_website():
     driver = create_driver()
+    first_run = True
     if not driver:
         send_telegram_message("Failed to initialize browser. Please check your configuration.")
         return
@@ -224,7 +291,6 @@ def monitor_website():
         # Initial scrape
         retry_count = 0
         previous_properties = read_properties_from_file()
-        
         while not previous_properties and retry_count < 5:  # Increased retries
             properties = scrape_properties(driver)
             if properties and len(properties) > 0:  # Make sure we have valid properties
@@ -254,14 +320,14 @@ def monitor_website():
         
         while True:
             try:
-                print("Checking for new properties...")
+                print("\n\n====================================================================\nChecking for new properties...")
                 current_properties = set(scrape_properties(driver))
                 
-                # Check for 502 error again explicitly
-                if is_502_error(driver):
-                    print("502 Bad Gateway Error detected during monitoring. Retrying...")
-                    time.sleep(10)  # Wait before retry
-                    continue
+                # # Check for 502 error again explicitly
+                # if is_502_error(driver):
+                #     print("502 Bad Gateway Error detected during monitoring. Retrying...")
+                #     time.sleep(10)  # Wait before retry
+                #     continue
                 
                 # Reset failure counter on success
                 if current_properties and len(current_properties) > 0:
@@ -293,7 +359,7 @@ def monitor_website():
                     
                 elif len(current_properties) < len(previous_properties):
                     removed_properties = previous_properties - current_properties
-                    message = f"{len(new_properties)} properties were removed.\n"
+                    message = f"{len(removed_properties)} properties were removed.\n"
                     for name, price in removed_properties:
                         message += f"Name: {name}\nPrice: {price}\n\n"
                     send_telegram_message(message)
@@ -304,7 +370,7 @@ def monitor_website():
                 
                 # Randomize wait time to avoid detection
                 wait_time = random.randint(10, 20)
-                print(f"Waiting for {wait_time} seconds before the next check...")
+                print(f"Waiting for {wait_time} seconds before the next check...\n====================================================================\n\n")
                 time.sleep(wait_time)
                 
             except Exception as e:
@@ -330,6 +396,7 @@ def monitor_website():
     finally:
         try:
             driver.quit()
+            os.remove(PROPERTIES_FILE) # delete the properties file
         except:
             pass
 
